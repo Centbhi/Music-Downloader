@@ -9,7 +9,7 @@ os.makedirs(PLAYLIST_DIR, exist_ok=True)
 
 options = {
     'format': 'bestaudio/best',
-    'outtmpl': f'{MUSIC_DIR}/%(title)s.%(ext)s',
+    'outtmpl': f'{MUSIC_DIR}/%(title)s [%(id).6s].%(ext)s',
     'writethumbnail': True,
     'postprocessors': [
         {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192',},
@@ -37,7 +37,6 @@ options2 = {
 
 url = input("Enter YouTube or YouTube Music URL: ")
 if url=="":
-    print("yur")
     url = [
         "https://youtube.com/playlist?list=PLJRxTuFUlT-eNwvPz9b6a38hvZOkSzW5q",#Camp of Joy
         "https://youtube.com/playlist?list=PLJRxTuFUlT-fvHDuHasztbeRsc35VsDTL",#Assorted Top Tier
@@ -62,9 +61,9 @@ if url=="":
         playlist_path = os.path.join(PLAYLIST_DIR, f"{playlist_name}.m3u")
 
         with open(playlist_path, "w", encoding="utf-8-sig") as f:
-                for entry in playlists.get('entries'):
-                    safe_title = sanitize_filename(entry['title'])
-                    f.write(f"Songs/{safe_title}.mp3\n")
+            for entry in playlists.get('entries'):
+                    safe_name = sanitize_filename(f"{entry['title']} [{entry['id'][:6]}]")
+                    f.write(f"Songs/{safe_name}.mp3\n")
 else:
     options.pop('download_archive', None)
     options['outtmpl'] = f'{PLAYLIST_DIR}/Podcasts/%(title)s.%(ext)s'

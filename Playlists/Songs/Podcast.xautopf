@@ -1,0 +1,12 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<SmartPlaylist SaveStaticCopy="False" LiveUpdating="True" Layout="4" LayoutGroupBy="0" ShuffleMode="None" ShuffleSameArtistWeight="0.5" GroupBy="track" ConsolidateAlbums="False" MusicLibraryPath="C:\Users\Cent\Desktop\MusicBee\Library\">
+  <Source Type="8">
+    <SourcePath Location="C:\Users\Cent\Desktop\musicDownloader\Playlists\Podcasts\" />
+    <Description />
+    <Conditions CombineMethod="All">
+      <Condition Field="ArtistPeople" Comparison="StartsWith" Value="" />
+    </Conditions>
+    <Limit FilterDuplicates="False" Enabled="False" Count="25" Type="Items" SelectedBy="Random" />
+    <SortBy Field="30" Order="Ascending" />
+  </Source>
+</SmartPlaylist>

@@ -25,6 +25,9 @@ options = {
     'js_runtimes': {
         'node': {}
     },
+    'playlistend': None,
+    'playlist_items': '1-',
+    'extract_flat': False,
     'remote_components': ['ejs:github'],
 }
 
@@ -32,6 +35,9 @@ options2 = {
     'js_runtimes': {
         'node': {}
     },
+    'extract_flat': 'in_playlist',
+    'playlistend': None,
+    'playlist_items': '1-',
     'remote_components': ['ejs:github']
 }
 

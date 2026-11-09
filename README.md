@@ -15,6 +15,8 @@ collection, and manage playlists.
   - `mutagen`
   - `ytmusicapi` (optional — used for search; falls back to yt-dlp search)
 
+  Install with `pip install -r requirements.txt`.
+
 ## Usage
 
 Run the app:
@@ -24,6 +26,23 @@ run.bat
 ```
 
 (or `python gui.py` to launch with a visible console).
+
+### Pin to taskbar / Start menu
+
+`run.bat` can't be pinned directly (Windows would pin the console host
+instead). To get a pinnable entry with the same behavior (no console window,
+repo root as working directory, green note icon):
+
+```
+powershell -ExecutionPolicy Bypass -File install_shortcut.ps1
+```
+
+This creates `Music Downloader` shortcuts in the repo folder, on the Desktop,
+and in the Start menu (so it's searchable). Then right-click one and choose
+`Pin to taskbar` (or drag it there) — that last step is manual, Windows
+blocks scripted pinning. Re-run the script after moving the folder or
+reinstalling Python, since shortcut paths are absolute. To change the icon,
+edit `tools/make_icon.py` and re-run it.
 
 ### Download tab
 Paste a YouTube URL (single video or playlist) or search by keyword, then press
@@ -35,14 +54,16 @@ videos from being fetched again.
 ### All Songs tab
 Every downloaded song in your library. The search box matches both title and
 artist. Click a column header to sort (Song / Artist / Date, ascending or
-descending). Double-click a row to play it, or right-click to add it to a
-playlist.
+descending). Double-click a row to play it, or right-click to toggle which
+playlists it belongs to (Playlists submenu, on/off per playlist without the
+menu closing) or delete it from disk.
 
 ### Library tab
 Your playlists (`Playlists\*.m3u`). Select one to see its songs in the right
 pane. **Refresh** re-downloads the playlist from its stored URL; playlists that
-have no URL yet will prompt for one once. Use the context menu to create, delete,
-or add songs to playlists.
+have no URL yet will prompt for one once. Refresh rebuilds the `.m3u` from the
+YouTube listing, so songs you added manually are dropped. Use the context menu to create,
+remove, or add songs to playlists.
 
 ### Player bar
 Play / pause, previous / next, volume, and the current track's artwork. Clicking
@@ -50,7 +71,7 @@ a song anywhere starts playback.
 
 Column widths and the active sort are remembered per tab across sessions.
 
-## detector.py
+## tools/detector.py
 
-Use `detector.py` to find videos that have become unavailable, so you can easily
-identify entries to remove from a playlist.
+Use `python tools/detector.py [playlist-url]` to find videos that have become
+unavailable, so you can easily identify entries to remove from a playlist.

@@ -1,0 +1,7 @@
+# Runtime deps (see README for system deps: Python 3.12, ffmpeg on PATH, Node.js).
+# ytmusicapi is optional — search falls back to yt-dlp without it.
+PyQt5
+yt-dlp
+requests
+mutagen
+ytmusicapi

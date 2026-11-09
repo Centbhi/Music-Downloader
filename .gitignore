@@ -1,6 +1,12 @@
 *.m3u
 *.txt
+!requirements.txt
 *.mp3
 *.jpg
+*.webm
+*.webp
+*.xautopf
+# Generated pinnable shortcuts (see install_shortcut.ps1); absolute paths.
+*.lnk
 .cache/
 __pycache__/

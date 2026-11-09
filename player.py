@@ -6,7 +6,7 @@ from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QLinearGradient,
                          QPainter, QPainterPath, QPixmap)
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
 from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QPushButton,
-                               QSizePolicy, QSlider, QSplitter, QToolButton,
+                               QSizePolicy, QSplitter, QToolButton,
                                QVBoxLayout, QWidget)
 
 import core
@@ -175,8 +175,12 @@ class VolumeSlider(QWidget):
 
     def setValue(self, v):
         if not self._dragging:
-            self._value = max(0, min(self._max, int(v)))
+            v = max(0, min(self._max, int(v)))
+            changed = v != self._value
+            self._value = v
             self.update()
+            if changed:
+                self.valueChanged.emit(self._value)
 
     def value(self):
         return self._value
@@ -266,6 +270,7 @@ class PlaybackManager(QObject):
         self._paths = []
         self._index = -1
         self._loop_mode = 'none'
+        self._pending_pos = None
         self.player = QMediaPlayer(self)
         self.player.stateChanged.connect(self._on_state)
         self.player.positionChanged.connect(self._on_position)
@@ -282,6 +287,15 @@ class PlaybackManager(QObject):
         self.duration_changed.emit(int(ms))
 
     def _on_media_status(self, status):
+        if status == QMediaPlayer.LoadedMedia and self._pending_pos is not None:
+            pos, self._pending_pos = self._pending_pos, None
+            try:
+                dur = self.player.duration()
+                if dur > 0:
+                    pos = max(0, min(pos, dur))
+                self.player.setPosition(pos)
+            except Exception:
+                pass
         if status == QMediaPlayer.EndOfMedia:
             if self._loop_mode == 'current':
                 self.player.setPosition(0)
@@ -296,6 +310,7 @@ class PlaybackManager(QObject):
         self.queue_changed.emit()
 
     def _load_current(self):
+        self._pending_pos = None
         if not (0 <= self._index < len(self._paths)):
             self.player.stop()
             return
@@ -352,26 +367,18 @@ class PlaybackManager(QObject):
     def reorder_queue(self, new_paths):
         playing = self.current_path()
         self._paths = list(new_paths)
-        if playing and playing in self._paths:
+        if not self._paths:
+            self._index = -1
+            self.player.stop()
+        elif playing and playing in self._paths:
             self._index = self._paths.index(playing)
+        elif playing:
+            # The current track was dropped from the queue: advance into the
+            # same slot (now the next track) instead of leaving a dead index.
+            self._index = min(self._index, len(self._paths) - 1)
+            self._load_current()
         else:
-            self._index = max(0, min(self._index, len(self._paths) - 1))
-        self.queue_changed.emit()
-
-    def remove_from_queue(self, idx):
-        if not (0 <= idx < len(self._paths)):
-            return
-        was_playing = (idx == self._index)
-        self._paths.pop(idx)
-        if was_playing:
-            if self._paths:
-                self._index = min(idx, len(self._paths) - 1)
-                self._load_current()
-            else:
-                self._index = -1
-                self.player.stop()
-        elif idx < self._index:
-            self._index -= 1
+            self._index = -1
         self.queue_changed.emit()
 
     def play_at_index(self, idx):
@@ -388,7 +395,8 @@ class PlaybackManager(QObject):
     def restore_state(self, settings):
         paths = settings.value('player/queue', [])
         if isinstance(paths, str):
-            paths = []
+            # QSettings collapses one-element QStringList to a plain str.
+            paths = [paths] if paths else []
         idx = int(settings.value('player/index', -1))
         pos = int(settings.value('player/position', 0))
         loop = settings.value('player/loop', 'none')
@@ -398,16 +406,13 @@ class PlaybackManager(QObject):
             self._index = idx
             self.player.setMedia(QMediaContent(
                 QUrl.fromLocalFile(self._paths[self._index])))
-            self.player.setPosition(pos)
+            # Seeks are ignored until the media finishes loading; the
+            # position is applied in _on_media_status on LoadedMedia.
+            self._pending_pos = pos if pos > 0 else None
             self.track_changed.emit(self._paths[self._index])
             self.queue_changed.emit()
             return True
         return False
-
-
-def _fmt(ms):
-    s = max(0, int(ms / 1000))
-    return f"{s // 60}:{s % 60:02d}"
 
 
 class PlayerBar(QWidget):
@@ -419,6 +424,7 @@ class PlayerBar(QWidget):
         self.playback = PlaybackManager(self)
         self._cover = None
         self._meta_worker = None
+        self._meta_workers = []
         self._build()
         self._connect()
 
@@ -557,6 +563,7 @@ class PlayerBar(QWidget):
         self.volume_slider.valueChanged.connect(self._on_volume)
         self.loop_btn.clicked.connect(self._cycle_loop)
         self.vol_btn.clicked.connect(self._toggle_mute)
+        pm.set_volume(self.volume_slider.value())
         self._update_loop_btn()
 
     def _cycle_loop(self):
@@ -617,9 +624,21 @@ class PlayerBar(QWidget):
         self._set_meta(display, "")
         self.cover_label.setPixmap(icons.make_pixmap('music_note', style.MUTED, 24))
         self._cover = None
-        self._meta_worker = TrackMetaWorker(path)
-        self._meta_worker.done.connect(self._on_meta)
-        self._meta_worker.start()
+        worker = TrackMetaWorker(path)
+        self._meta_worker = worker
+        # Keep a strong ref until finished so rapid track changes cannot
+        # drop the last reference to a still-running QThread.
+        self._meta_workers.append(worker)
+        worker.done.connect(self._on_meta)
+        worker.finished.connect(lambda w=worker: self._release_meta_worker(w))
+        worker.start()
+
+    def _release_meta_worker(self, worker):
+        worker.deleteLater()
+        try:
+            self._meta_workers.remove(worker)
+        except ValueError:
+            pass
 
     def _elide_2lines(self, text, font_size):
         if not text:
@@ -688,4 +707,6 @@ class PlayerBar(QWidget):
         sp = settings.value('player/splitter')
         if sp:
             self._splitter.restoreState(sp)
-        return self.playback.restore_state(settings)
+        ok = self.playback.restore_state(settings)
+        self._update_loop_btn()
+        return ok

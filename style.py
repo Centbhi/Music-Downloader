@@ -26,6 +26,17 @@ QLabel#brandicon {{
     background-color: {ACCENT}; color: {BG}; border-radius: 16px;
     font-size: 18px; font-weight: 800;
 }}
+#titlebar {{ background-color: {BG}; border-bottom: 1px solid {BORDER}; }}
+QToolButton#winbtn {{
+    border: none; background-color: transparent; border-radius: 0;
+    padding: 0;
+}}
+QToolButton#winbtn:hover {{ background-color: {SURFACE3}; border: none; }}
+QToolButton#winclose {{
+    border: none; background-color: transparent; border-radius: 0;
+    padding: 0;
+}}
+QToolButton#winclose:hover {{ background-color: #e81123; border: none; }}
 QLabel#cover {{ border-radius: 6px; background-color: {SURFACE2}; }}
 QLabel#tracktitle {{ font-size: 13px; font-weight: 600; }}
 QLabel#trackartist {{ color: {MUTED}; font-size: 12px; }}
@@ -97,12 +108,10 @@ QListWidget#sidebar::item:selected {{ background-color: {SURFACE2}; color: {TEXT
 
 QTableWidget {{
     background: transparent; border: none; color: {TEXT};
-    alternate-background-color: {SURFACE};
     selection-background-color: {SURFACE3}; selection-color: {TEXT};
 }}
 QTableWidget::item {{ padding: 6px 8px; border: none; }}
-QTableWidget::item:hover {{ background-color: {SURFACE2}; }}
-QTableWidget::item:selected {{ background-color: {SURFACE3}; color: {TEXT}; }}
+QTableWidget::item:selected {{ background-color: {SURFACE3}; }}
 QHeaderView {{ background: transparent; }}
 QHeaderView::section {{
     background-color: {BG}; color: {MUTED}; border: none;

@@ -6,15 +6,18 @@ from datetime import datetime
 
 os.environ.setdefault('QT_MULTIMEDIA_PREFERRED_PLUGINS', 'windowsmediafoundation')
 
-from PyQt5.QtCore import QEvent, QObject, QSettings, QThread, pyqtSignal, Qt
-from PyQt5.QtGui import QColor, QPalette, QPainter, QPainterPath, QPixmap
+from PyQt5.QtCore import (QEvent, QObject, QRect, QSettings, QSize, QThread,
+                           QTimer, pyqtSignal, Qt)
+from PyQt5.QtGui import (QColor, QCursor, QPalette, QPainter, QPainterPath,
+                         QPixmap)
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QStackedWidget, QWidget, QVBoxLayout,
     QHBoxLayout, QLineEdit, QPlainTextEdit, QPushButton, QAbstractButton,
     QListWidget, QListWidgetItem, QLabel, QSplitter, QTextEdit, QProgressBar,
-    QMessageBox, QComboBox, QScrollArea, QFrame, QMenu,
+    QMessageBox, QComboBox, QScrollArea, QFrame, QMenu, QToolButton,
     QInputDialog, QTableWidget, QTableWidgetItem, QAbstractItemView,
-    QHeaderView, QStyledItemDelegate, QStyleOptionViewItem,
+    QHeaderView, QStyledItemDelegate, QStyleOptionViewItem, QStyle,
+    QScrollBar, QSlider,
 )
 
 import core
@@ -98,12 +101,20 @@ def _populate_song_table(table, rows, current_path=None):
 
 
 class SongTable(QTableWidget):
+    # Emitted when dropEvent performs a manual insert-move (Qt's own
+    # rowsMoved is only emitted for native Above/Below drops).
+    rowsReordered = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._settings_key = None
         self._balancing = False
         self._dragging = False
         self._last_resized = None
+        self._hover_row = -1
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+        self.viewport().installEventFilter(self)
 
     def _rebalance(self, avoid=None):
         if self._balancing:
@@ -144,6 +155,16 @@ class SongTable(QTableWidget):
                     _settings().setValue(
                         self._settings_key + '/columns',
                         self.horizontalHeader().saveState())
+        elif obj is self.viewport():
+            if event.type() == QEvent.Leave:
+                if self._hover_row != -1:
+                    self._hover_row = -1
+                    self.viewport().update()
+            elif event.type() == QEvent.MouseMove:
+                row = self.indexAt(event.pos()).row()
+                if row != self._hover_row:
+                    self._hover_row = row
+                    self.viewport().update()
         return super().eventFilter(obj, event)
 
     def _on_section_resized(self, index, *args):
@@ -153,6 +174,61 @@ class SongTable(QTableWidget):
             _settings().setValue(
                 self._settings_key + '/columns',
                 self.horizontalHeader().saveState())
+
+    def _insert_row_for_drop(self, pos, dragged):
+        """Insert index for an internal drop, or None for a no-op.
+
+        Always an insert position: OnItem drops land above/below based
+        on the cursor half, so rows are never overwritten and no blank
+        rows are left behind.
+        """
+        target = self.indexAt(pos).row()
+        indicator = self.dropIndicatorPosition()
+        if target < 0 or indicator == QAbstractItemView.BelowItem:
+            insert = self.rowCount() if target < 0 else target + 1
+        elif indicator == QAbstractItemView.AboveItem:
+            insert = target
+        else:  # OnItem: upper half inserts above, lower half below.
+            rect = self.visualRect(self.model().index(target, 0))
+            insert = target if pos.y() < rect.center().y() else target + 1
+        # Account for rows above the insert point being removed first.
+        insert -= sum(1 for r in dragged if r < insert)
+        if insert == dragged[0]:
+            return None
+        return insert
+
+    def dropEvent(self, event):
+        # Qt replaces cells on OnItem drops even with overwrite mode off,
+        # so take over internal moves and always insert: never overwrite,
+        # never leave blank rows behind.
+        if event.source() is not self:
+            super().dropEvent(event)
+            return
+        sel = self.selectionModel().selectedRows()
+        dragged = sorted(i.row() for i in sel)
+        if not dragged:
+            event.ignore()
+            return
+        insert = self._insert_row_for_drop(event.pos(), dragged)
+        if insert is None:
+            # Dropped back where it started: nothing to do.
+            event.ignore()
+            return
+        taken = []
+        for r in reversed(dragged):
+            taken.append([self.takeItem(r, c)
+                          for c in range(self.columnCount())])
+            self.removeRow(r)
+        taken.reverse()
+        for offset, cells in enumerate(taken):
+            self.insertRow(insert + offset)
+            for c, cell in enumerate(cells):
+                if cell is not None:
+                    self.setItem(insert + offset, c, cell)
+        event.setDropAction(Qt.MoveAction)
+        event.accept()
+        self.clearSelection()
+        self.rowsReordered.emit()
 
 
 class _PlayingDelegate(QStyledItemDelegate):
@@ -164,9 +240,21 @@ class _PlayingDelegate(QStyledItemDelegate):
         self._playing_rows = set(rows)
 
     def paint(self, painter, option, index):
+        # Row backgrounds are painted here (not in QSS) so hover can cover
+        # the whole row: selected > hover > alternate stripe.
+        if index.isValid() and not (option.state & QStyle.State_Selected):
+            table = self.parent()
+            hover = getattr(table, '_hover_row', -1)
+            if index.row() == hover:
+                painter.fillRect(option.rect, QColor(style.SURFACE2))
+            elif (index.row() % 2 == 1 and table is not None
+                    and table.alternatingRowColors()):
+                painter.fillRect(option.rect, QColor(style.SURFACE))
         if index.row() in self._playing_rows:
             opt = QStyleOptionViewItem(option)
             opt.palette.setColor(QPalette.Text, QColor(style.ACCENT_HOVER))
+            opt.palette.setColor(
+                QPalette.HighlightedText, QColor(style.ACCENT_HOVER))
             super().paint(painter, opt, index)
         else:
             super().paint(painter, option, index)
@@ -227,6 +315,27 @@ class NoScrollFilter(QObject):
         if event.type() == QEvent.Wheel:
             return True
         return super().eventFilter(obj, event)
+
+
+class _StickyMenu(QMenu):
+    """QMenu that stays open when a checkable action is clicked.
+
+    Standard QMenu hides the whole menu chain on any mouse release.
+    For the Playlists toggle submenu that makes multi-toggle impossible,
+    so left-clicks landing on a checkable action only trigger it
+    (flipping the checkmark) without hiding. Everything else — normal
+    actions, keyboard activation, clicks elsewhere — keeps default
+    behavior.
+    """
+
+    def mouseReleaseEvent(self, event):
+        act = self.activeAction()
+        if (act is not None and act.isCheckable() and act.isEnabled()
+                and event.button() == Qt.LeftButton):
+            act.trigger()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class ResultRow(QFrame):
@@ -333,15 +442,31 @@ class DownloadWorker(QThread):
         super().__init__(parent)
         self.url = url
         self._cancel = {'flag': False}
+        self._last_pct = None
 
     def request_cancel(self):
         self._cancel['flag'] = True
+
+    def _progress(self, d):
+        if d.get('status') != 'downloading':
+            return
+        total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+        if not total:
+            return
+        pct = int(d.get('downloaded_bytes', 0) * 100 / total)
+        idx = (d.get('info_dict') or {}).get('playlist_index')
+        key = (idx, pct)
+        if key == self._last_pct:
+            return
+        self._last_pct = key
+        prefix = f"[{idx}] " if idx else ""
+        self.log.emit(f"Downloading... {prefix}{pct}%")
 
     def run(self):
         try:
             result = core.download_url(
                 self.url,
-                progress_cb=None, cancel_flag=self._cancel)
+                progress_cb=self._progress, cancel_flag=self._cancel)
             self.done.emit({'ok': True, 'result': result})
         except core.DownloadCancelled:
             self.done.emit({'ok': True, 'cancelled': True, 'result': None})
@@ -357,6 +482,7 @@ class DownloadTab(QWidget):
         self.on_download_finished = on_download_finished
         self.worker = None
         self.search_worker = None
+        self._search_workers = []
         self._build()
 
     def _build(self):
@@ -426,11 +552,27 @@ class DownloadTab(QWidget):
             return
         self._clear_results()
         self.status_message.emit(f"Searching for \"{query}\"...")
-        self.search_worker = SearchWorker(query)
-        self.search_worker.results.connect(self.show_results)
-        self.search_worker.failed.connect(
-            lambda e: self.status_message.emit(f"Search failed: {e}"))
-        self.search_worker.start()
+        worker = SearchWorker(query)
+        self.search_worker = worker
+        # Keep a strong ref until finished so a new search cannot drop the
+        # last reference to a still-running QThread.
+        self._search_workers.append(worker)
+        worker.results.connect(self.show_results)
+        worker.failed.connect(self._on_search_failed)
+        worker.finished.connect(lambda w=worker: self._release_search_worker(w))
+        worker.start()
+
+    def _on_search_failed(self, error):
+        if self.sender() is not self.search_worker:
+            return
+        self.status_message.emit(f"Search failed: {error}")
+
+    def _release_search_worker(self, worker):
+        worker.deleteLater()
+        try:
+            self._search_workers.remove(worker)
+        except ValueError:
+            pass
 
     def _clear_results(self):
         while self.results_layout.count() > 1:
@@ -440,6 +582,9 @@ class DownloadTab(QWidget):
                 w.deleteLater()
 
     def show_results(self, results):
+        if self.sender() is not self.search_worker:
+            # A newer search superseded this one; drop stale results.
+            return
         self._clear_results()
         for r in results:
             row = ResultRow(r)
@@ -595,9 +740,8 @@ class LibraryTab(QWidget):
         self.play_btn.setProperty("accent", True)
         self.play_btn.setIcon(icons.make_icon('play', '#000000', 14))
         self.play_btn.clicked.connect(self.play_selected)
-        self.delete_btn = QPushButton("Delete selected")
-        self.delete_btn.setProperty("danger", True)
-        self.delete_btn.setIcon(icons.make_icon('trash', '#ffffff', 14))
+        self.delete_btn = QPushButton("Remove selected")
+        self.delete_btn.setIcon(icons.make_icon('trash', style.TEXT, 14))
         self.delete_btn.clicked.connect(self.delete_song)
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setIcon(icons.make_icon('refresh', style.TEXT, 14))
@@ -710,6 +854,7 @@ class LibraryTab(QWidget):
         entry = data['entry']
 
         menu = QMenu(self)
+        remove_act = menu.addAction("Remove from playlist")
         sub = menu.addMenu("Add to playlist")
         real = [p for p in self.playlists if p['path']]
         if not real:
@@ -726,6 +871,35 @@ class LibraryTab(QWidget):
         if chosen is None:
             return
         title = os.path.splitext(os.path.basename(entry))[0]
+        if chosen is remove_act:
+            playlist_path = data.get('playlist_path')
+            if playlist_path is None:
+                ret = QMessageBox.question(
+                    self, "Delete song",
+                    f"Delete \"{title}\" from disk?",
+                    QMessageBox.Yes | QMessageBox.No)
+                if ret != QMessageBox.Yes:
+                    return
+                try:
+                    core.delete_song_everywhere(entry)
+                except Exception as e:
+                    QMessageBox.critical(self, "Delete failed", str(e))
+                    return
+                self.status_message.emit(f"Deleted {title}")
+                self.reload()
+                return
+            try:
+                removed = core.remove_entry_from_playlist(
+                    playlist_path, entry)
+            except Exception as e:
+                QMessageBox.critical(self, "Remove failed", str(e))
+                return
+            if removed:
+                self.status_message.emit(f"Removed \"{title}\" from playlist")
+            else:
+                self.status_message.emit(f"Already removed \"{title}\"")
+            self.reload()
+            return
         if chosen is new_act:
             name, ok = QInputDialog.getText(
                 self, "New playlist", "Playlist name:")
@@ -842,18 +1016,44 @@ class LibraryTab(QWidget):
             return
         data = self.song_table.item(row, 0).data(Qt.UserRole)
         name = os.path.basename(data['entry'])
+        playlist_path = data.get('playlist_path')
+        if playlist_path is None:
+            # Podcasts pseudo-playlist has no .m3u; removing means deleting the file.
+            ret = QMessageBox.question(
+                self, "Delete song",
+                f"Delete \"{name}\" from disk?",
+                QMessageBox.Yes | QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return
+            try:
+                core.delete_song_everywhere(data['entry'])
+            except Exception as e:
+                QMessageBox.critical(self, "Delete failed", str(e))
+                return
+            self.status_message.emit(f"Deleted {name}")
+            self.reload()
+            return
+        current = self.playlist_list.currentItem()
+        playlist_name = (os.path.splitext(current.data(Qt.UserRole)['name'])[0]
+                         if current else os.path.basename(playlist_path))
         ret = QMessageBox.question(
-            self, "Delete song",
-            f"Delete \"{name}\" from disk and its playlist?",
+            self, "Remove song",
+            f"Remove \"{name}\" from \"{playlist_name}\"?\n"
+            "The file stays in All Songs.",
             QMessageBox.Yes | QMessageBox.No)
         if ret != QMessageBox.Yes:
             return
         try:
-            core.remove_song(data['playlist_path'], data['entry'])
+            removed = core.remove_entry_from_playlist(
+                playlist_path, data['entry'])
         except Exception as e:
-            QMessageBox.critical(self, "Delete failed", str(e))
+            QMessageBox.critical(self, "Remove failed", str(e))
             return
-        self.status_message.emit(f"Deleted {name}")
+        if removed:
+            self.status_message.emit(
+                f"Removed {name} from {playlist_name}")
+        else:
+            self.status_message.emit(f"Already removed {name}")
         self.reload()
 
     def show_playlist_menu(self, pos):
@@ -980,7 +1180,7 @@ class AllSongsTab(QWidget):
         for song in self.songs:
             if text:
                 hay = ' '.join((
-                    song['title'], song['source'],
+                    song['title'],
                     self.artists.get(song['full'], '') or '')).lower()
                 if text not in hay:
                     continue
@@ -1074,23 +1274,111 @@ class AllSongsTab(QWidget):
         if item is None:
             return
         row = self.song_table.row(item)
-        entry = item.data(Qt.UserRole)
+        col0 = self.song_table.item(row, 0)
+        entry = col0.data(Qt.UserRole) if col0 else None
+        if not entry:
+            return
         song = self._displayed[row]
 
+        try:
+            member = set(core.playlists_for_song(song['full']))
+        except Exception:
+            member = set()
+
         menu = QMenu(self)
-        sub = menu.addMenu("Add to playlist")
+        sub = _StickyMenu("Playlists", menu)
+        menu.addMenu(sub)
+        delete_act = menu.addAction("Delete from disk")
+        state = {'dirty': False}
+
+        def _on_toggled(checked, playlist_path=None, stem=None,
+                        act=None):
+            try:
+                if checked:
+                    added = core.add_song_to_playlist(
+                        playlist_path, entry)
+                    if added:
+                        member.add(stem)
+                        self.status_message.emit(
+                            f"Added \"{song['title']}\" to {stem}")
+                    else:
+                        self.status_message.emit(
+                            f"Already in {stem}")
+                else:
+                    removed = core.remove_entry_from_playlist(
+                        playlist_path, entry)
+                    if removed:
+                        member.discard(stem)
+                        self.status_message.emit(
+                            f"Removed \"{song['title']}\" from {stem}")
+                    else:
+                        self.status_message.emit(
+                            f"Already removed from {stem}")
+                state['dirty'] = True
+            except Exception as e:
+                if act is not None:
+                    act.blockSignals(True)
+                    act.setChecked(not checked)
+                    act.blockSignals(False)
+                self.status_message.emit(f"Playlist update failed: {e}")
+
         if not self.playlists:
             act = sub.addAction("No playlists yet")
             act.setEnabled(False)
         for p in self.playlists:
-            name = os.path.splitext(p['name'])[0]
-            act = sub.addAction(name)
-            act.setData(p['path'])
+            stem = os.path.splitext(p['name'])[0]
+            act = sub.addAction(stem)
+            act.setCheckable(True)
+            act.setChecked(stem in member)
+            act.triggered.connect(
+                lambda checked, pp=p['path'], st=stem, ac=act:
+                _on_toggled(checked, pp, st, ac))
         sub.addSeparator()
         new_act = sub.addAction("New playlist...")
 
+        def _flush():
+            if state['dirty']:
+                state['dirty'] = False
+                if self.on_change:
+                    self.on_change()
+                else:
+                    self._apply_filter()
+        menu.aboutToHide.connect(_flush)
+
         chosen = menu.exec_(self.song_table.viewport().mapToGlobal(pos))
         if chosen is None:
+            return
+        if chosen is delete_act:
+            try:
+                containing = core.playlists_for_song(song['full'])
+            except Exception:
+                containing = []
+            if containing:
+                extra = (f"\nAlso removes it from: "
+                         f"{', '.join(containing)}.")
+            else:
+                extra = ""
+            ret = QMessageBox.question(
+                self, "Delete song",
+                f"Delete \"{song['title']}\" from disk?{extra}",
+                QMessageBox.Yes | QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return
+            try:
+                affected = core.delete_song_everywhere(entry)
+            except Exception as e:
+                QMessageBox.critical(self, "Delete failed", str(e))
+                return
+            if affected:
+                self.status_message.emit(
+                    f"Deleted \"{song['title']}\" "
+                    f"(removed from {', '.join(affected)})")
+            else:
+                self.status_message.emit(f"Deleted \"{song['title']}\"")
+            if self.on_change:
+                self.on_change()
+            else:
+                self._apply_filter()
             return
         if chosen is new_act:
             name, ok = QInputDialog.getText(
@@ -1101,15 +1389,9 @@ class AllSongsTab(QWidget):
             added = core.add_song_to_playlist(path, entry)
             msg = (f"Added \"{song['title']}\" to {name.strip()}"
                    if added else f"Already in {name.strip()}")
-        else:
-            path = chosen.data()
-            added = core.add_song_to_playlist(path, entry)
-            name = os.path.splitext(os.path.basename(path))[0]
-            msg = (f"Added \"{song['title']}\" to {name}"
-                   if added else f"Already in {name}")
-        self.status_message.emit(msg)
-        if added and self.on_change:
-            self.on_change()
+            self.status_message.emit(msg)
+            if self.on_change:
+                self.on_change()
 
 
 class SpaceToggleFilter(QObject):
@@ -1132,6 +1414,8 @@ class SpaceToggleFilter(QObject):
 
 
 class QueueTab(QWidget):
+    reordered = pyqtSignal(list)
+
     def __init__(self, play_request, parent=None):
         super().__init__(parent)
         self.play_request = play_request
@@ -1149,28 +1433,20 @@ class QueueTab(QWidget):
         title.setObjectName("navheader")
         root.addWidget(title)
 
-        self.song_table = SongTable()
-        self.song_table.setColumnCount(3)
-        self.song_table.setHorizontalHeaderLabels(["Song", "Artist", "Date"])
-        self.song_table.verticalHeader().setVisible(False)
-        self.song_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.song_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.song_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.song_table.setShowGrid(False)
-        self.song_table.setWordWrap(False)
-        self.song_table.setTextElideMode(Qt.ElideRight)
-        self.song_table.setAlternatingRowColors(True)
-        self.song_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.song_table = _configure_song_table(SongTable(), 'queue')
         hh = self.song_table.horizontalHeader()
-        hh.setStretchLastSection(True)
         hh.setSectionsClickable(False)
         self.song_table.setDragDropMode(QAbstractItemView.InternalMove)
         self.song_table.setDefaultDropAction(Qt.MoveAction)
+        # Default overwrite mode drops ONTO the target row (replacing its
+        # cells). Off = insert-between-rows indicator = true reorder.
+        self.song_table.setDragDropOverwriteMode(False)
         self.song_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.song_table.customContextMenuRequested.connect(
             self._show_context_menu)
         self.song_table.cellDoubleClicked.connect(self._play_item)
         self.song_table.model().rowsMoved.connect(self._on_rows_moved)
+        self.song_table.rowsReordered.connect(self._on_rows_moved)
         root.addWidget(self.song_table, 1)
 
         btn_row = QHBoxLayout()
@@ -1182,12 +1458,20 @@ class QueueTab(QWidget):
         root.addLayout(btn_row)
 
     def _on_rows_moved(self):
+        playing = (self._queue[self._current]
+                   if 0 <= self._current < len(self._queue) else None)
         items = []
         for i in range(self.song_table.rowCount()):
             item = self.song_table.item(i, 0)
             if item:
                 items.append(item.data(Qt.UserRole))
         self._queue = items
+        if playing is not None:
+            try:
+                self._current = items.index(playing)
+            except ValueError:
+                self._current = -1
+        self.reordered.emit(list(items))
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1218,34 +1502,29 @@ class QueueTab(QWidget):
     def _populate(self):
         current_path = (self._queue[self._current]
                         if 0 <= self._current < len(self._queue) else None)
-        self.song_table.setRowCount(0)
-        self.song_table.setRowCount(len(self._queue))
-        for row, path in enumerate(self._queue):
-            name = os.path.basename(path)
-            display = re.sub(r"\s*\[[A-Za-z0-9_-]{6}\]\.mp3$", "", name)
-            display = os.path.splitext(display)[0]
-            playing = (current_path
-                       and os.path.normpath(path) == os.path.normpath(current_path))
-            if playing:
-                display = "\u25B6 " + display
-            try:
-                artist = core._read_artist(path) or ''
-            except Exception:
-                artist = ''
+        infos = []
+        for path in self._queue:
             try:
                 mtime = os.path.getmtime(path)
-                date = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d') if mtime else ''
-            except Exception:
-                date = ''
-            items = [QTableWidgetItem(display),
-                     QTableWidgetItem(artist),
-                     QTableWidgetItem(date)]
-            items[0].setData(Qt.UserRole, path)
-            if playing:
-                for it in items:
-                    it.setForeground(QColor(style.ACCENT_HOVER))
-            for col, it in enumerate(items):
-                self.song_table.setItem(row, col, it)
+            except OSError:
+                mtime = 0
+            infos.append({'full': path, 'mtime': mtime})
+        try:
+            artists = core.get_artists(infos)
+        except Exception:
+            artists = {}
+        rows = []
+        for info in infos:
+            path = info['full']
+            name = os.path.basename(path)
+            rows.append({
+                'song': {'title': os.path.splitext(name)[0],
+                         'mtime': info['mtime']},
+                'artist': artists.get(os.path.normpath(path)) or '',
+                'full': path,
+                'user_data': path,
+            })
+        _populate_song_table(self.song_table, rows, current_path)
 
     def _play_item(self, row, _col=None):
         if 0 <= row < len(self._queue):
@@ -1267,10 +1546,17 @@ class QueueTab(QWidget):
             self.song_table.removeRow(row)
             if 0 <= row < len(self._queue):
                 self._queue.pop(row)
+                if self._current > row:
+                    self._current -= 1
+                elif self._current == row:
+                    self._current = -1
+                self.reordered.emit(list(self._queue))
 
     def _clear_queue(self):
         self.song_table.setRowCount(0)
         self._queue.clear()
+        self._current = -1
+        self.reordered.emit([])
 
 _WM_APPCOMMAND = 0x0319
 _WM_HOTKEY = 0x0312
@@ -1297,17 +1583,203 @@ class _MSG(ctypes.Structure):
     ]
 
 
+class TitleBar(QWidget):
+    """Custom frameless title bar (VSCode-style).
+
+    Drag to move (double-click toggles maximize), with minimize /
+    maximize-or-restore / close buttons top-right. Needs the
+    FramelessWindowHint on MainWindow; edge resizing is handled by
+    WindowResizeFilter.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("titlebar")
+        self.setFixedHeight(36)
+        self._drag_pos = None
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addStretch(1)
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(0)
+        self.min_btn = self._btn('minimize', "Minimize")
+        self.max_btn = self._btn('maximize', "Maximize")
+        self.close_btn = self._btn('close', "Close")
+        self.close_btn.setObjectName("winclose")
+        self.min_btn.clicked.connect(lambda: self.window().showMinimized())
+        self.max_btn.clicked.connect(self._toggle_max)
+        self.close_btn.clicked.connect(lambda: self.window().close())
+        for b in (self.min_btn, self.max_btn, self.close_btn):
+            btn_row.addWidget(b)
+        lay.addLayout(btn_row)
+
+    def _btn(self, icon, tip):
+        b = QToolButton(self)
+        b.setObjectName("winbtn")
+        b.setFixedSize(46, 36)
+        b.setIcon(icons.make_icon(icon, style.MUTED, 14))
+        b.setIconSize(QSize(14, 14))
+        b.setToolTip(tip)
+        b.setCursor(Qt.PointingHandCursor)
+        return b
+
+    def _is_max(self):
+        w = self.window()
+        return w.isMaximized() or w.isFullScreen()
+
+    def _toggle_max(self):
+        w = self.window()
+        if w.isMaximized():
+            w.showNormal()
+        else:
+            w.showMaximized()
+
+    def refresh_max_icon(self):
+        name = 'restore' if self.window().isMaximized() else 'maximize'
+        self.max_btn.setIcon(icons.make_icon(name, style.MUTED, 14))
+        self.max_btn.setToolTip(
+            "Restore" if self.window().isMaximized() else "Maximize")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and not self._is_max():
+            self._drag_pos = (event.globalPos()
+                              - self.window().geometry().topLeft())
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._drag_pos is not None and event.buttons() & Qt.LeftButton
+                and not self._is_max()):
+            self.window().move(event.globalPos() - self._drag_pos)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._toggle_max()
+        super().mouseDoubleClickEvent(event)
+
+
+_RESIZE_MARGIN = 6
+_RESIZE_MIN_DRAG = 3
+
+
+class WindowResizeFilter(QObject):
+    """Frameless edge resize for left/right/bottom edges + corners.
+
+    Installed on the QApplication (same pattern as SpaceToggleFilter).
+    The top edge belongs to TitleBar (window drag), so it is excluded.
+    Plain clicks pass through untouched; scrollbar / slider / header /
+    button / title-bar presses never arm a resize.
+    """
+
+    def __init__(self, window, parent=None):
+        super().__init__(parent)
+        self.window = window
+        self._edges = None
+        self._start_geom = None
+        self._start_pos = None
+        self._active = False
+
+    def _zone(self, global_pos):
+        # Client coords: on Windows a frameless window's frameGeometry
+        # extends into the invisible system border, which would push the
+        # hit zone off the visible edge.
+        g = self.window.geometry()
+        m = _RESIZE_MARGIN
+        left = abs(global_pos.x() - g.left()) <= m
+        right = abs(g.right() - global_pos.x()) <= m
+        bottom = abs(g.bottom() - global_pos.y()) <= m
+        return left, right, bottom
+
+    def _cursor(self, zone):
+        left, right, bottom = zone
+        if (left or right) and bottom:
+            return QCursor(Qt.SizeBDiagCursor if left
+                           else Qt.SizeFDiagCursor)
+        if left or right:
+            return QCursor(Qt.SizeHorCursor)
+        return QCursor(Qt.SizeVerCursor)
+
+    def eventFilter(self, obj, event):
+        w = self.window
+        if w.isMaximized() or w.isFullScreen():
+            return False
+        t = event.type()
+        if t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            pos = event.globalPos()
+            zone = self._zone(pos)
+            if not any(zone):
+                return False
+            under = QApplication.widgetAt(pos)
+            if isinstance(under, (QScrollBar, QSlider, QHeaderView,
+                                  QAbstractButton, TitleBar)):
+                return False
+            self._edges = zone
+            self._start_geom = w.geometry()
+            self._start_pos = pos
+            self._active = False
+            return False
+        if t == QEvent.MouseMove and self._edges is not None:
+            if event.buttons() & Qt.LeftButton:
+                if not self._active:
+                    delta = event.globalPos() - self._start_pos
+                    if delta.manhattanLength() < _RESIZE_MIN_DRAG:
+                        return False
+                    self._active = True
+                    QApplication.setOverrideCursor(
+                        self._cursor(self._edges))
+                self._resize_to(event.globalPos())
+                return True
+            self._edges = None
+            return False
+        if t == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            if self._active:
+                self._active = False
+                self._edges = None
+                QApplication.restoreOverrideCursor()
+                return True
+            self._edges = None
+            return False
+        return False
+
+    def _resize_to(self, pos):
+        left, right, bottom = self._edges
+        g = QRect(self._start_geom)
+        dx = pos.x() - self._start_pos.x()
+        dy = pos.y() - self._start_pos.y()
+        mini = self.window.minimumSize()
+        if right:
+            g.setRight(max(g.left() + mini.width() - 1,
+                           self._start_geom.right() + dx))
+        if left:
+            g.setLeft(min(g.right() - mini.width() + 1,
+                          self._start_geom.left() + dx))
+        if bottom:
+            g.setBottom(max(g.top() + mini.height() - 1,
+                            self._start_geom.bottom() + dy))
+        self.window.setGeometry(g)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Music Downloader")
         self.setWindowFlag(Qt.FramelessWindowHint, True)
         self.resize(1080, 780)
+        self.setMinimumSize(720, 520)
 
         central = QWidget()
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        self.title_bar = TitleBar()
+        root.addWidget(self.title_bar)
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
@@ -1387,6 +1859,7 @@ class MainWindow(QMainWindow):
 
         self.player_bar.queue_changed.connect(self._sync_queue)
         self.player_bar.current_track.connect(self._sync_queue_current)
+        self.queue_tab.reordered.connect(self._on_queue_reordered)
 
         settings = QSettings("MusicDownloader", "MusicDownloader")
         geom = settings.value('window/geometry')
@@ -1395,24 +1868,30 @@ class MainWindow(QMainWindow):
         body_sp = settings.value('window/splitter_body')
         if body_sp:
             self.body_splitter.restoreState(body_sp)
-        if settings.value('player/queue'):
-            self.player_bar.restore_state(settings)
-            was_playing = self.player_bar.playback.current_path() is not None
-            if was_playing:
-                self._sync_queue()
-                self._sync_queue_current(self.player_bar.playback.current_path())
+        # Always restore so volume/splitter/loop apply even with an empty queue.
+        self.player_bar.restore_state(settings)
+        current = self.player_bar.playback.current_path()
+        if current is not None:
+            self._sync_queue()
+            self._sync_queue_current(current)
 
         self._space_filter = SpaceToggleFilter(self.player_bar.playback, self)
         QApplication.instance().installEventFilter(self._space_filter)
+        self._resize_filter = WindowResizeFilter(self, self)
+        QApplication.instance().installEventFilter(self._resize_filter)
 
         self._hotkey_ids = []
-        user32 = ctypes.windll.user32
-        hwnd = int(self.winId())
-        for i, vk in enumerate([
-            _VK_MEDIA_PLAY_PAUSE, _VK_MEDIA_NEXT_TRACK, _VK_MEDIA_PREV_TRACK,
-        ], 1):
-            if user32.RegisterHotKey(hwnd, i, _MOD_NOREPEAT, vk):
-                self._hotkey_ids.append(i)
+        if os.name == 'nt':
+            try:
+                user32 = ctypes.windll.user32
+                hwnd = int(self.winId())
+                for i, vk in enumerate([
+                    _VK_MEDIA_PLAY_PAUSE, _VK_MEDIA_NEXT_TRACK, _VK_MEDIA_PREV_TRACK,
+                ], 1):
+                    if user32.RegisterHotKey(hwnd, i, _MOD_NOREPEAT, vk):
+                        self._hotkey_ids.append(i)
+            except Exception:
+                self._hotkey_ids = []
 
     def refresh_library(self):
         self.library_tab.reload()
@@ -1431,17 +1910,29 @@ class MainWindow(QMainWindow):
     def _sync_queue_current(self, path):
         self.queue_tab.set_current(path)
 
+    def _on_queue_reordered(self, paths):
+        self.player_bar.playback.reorder_queue(paths)
+
     def closeEvent(self, event):
-        user32 = ctypes.windll.user32
-        hwnd = int(self.winId())
-        for hid in self._hotkey_ids:
-            user32.UnregisterHotKey(hwnd, hid)
+        if os.name == 'nt' and self._hotkey_ids:
+            try:
+                user32 = ctypes.windll.user32
+                hwnd = int(self.winId())
+                for hid in self._hotkey_ids:
+                    user32.UnregisterHotKey(hwnd, hid)
+            except Exception:
+                pass
         settings = QSettings("MusicDownloader", "MusicDownloader")
         self.player_bar.save_state(settings)
         settings.setValue('window/geometry', self.saveGeometry())
         settings.setValue('window/splitter_body', self.body_splitter.saveState())
         settings.setValue('player/loop', self.player_bar.playback.loop_mode())
         super().closeEvent(event)
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.WindowStateChange:
+            self.title_bar.refresh_max_icon()
+        super().changeEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_F11, Qt.Key_Escape):
@@ -1480,7 +1971,6 @@ class MainWindow(QMainWindow):
                         pm.previous()
                         return True, 0
                     elif cmd == _APPCOMMAND_VOLUME_MUTE:
-                        from PyQt5.QtCore import QTimer
                         QTimer.singleShot(0, self.player_bar._toggle_mute)
                         return True, 0
             except Exception:
@@ -1489,12 +1979,21 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    if os.name == 'nt':
+        # Explicit ID so the pinned shortcut and the running window group
+        # under one taskbar icon (must match install_shortcut.ps1).
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "MusicDownloader.MusicDownloader")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
     app.setApplicationName("Music Downloader")
+    app.setOrganizationName("MusicDownloader")
     app.setStyle("fusion")
     app.setStyleSheet(style.QSS)
     win = MainWindow()
-    win.showFullScreen()
+    win.show()
     sys.exit(app.exec_())
 
 

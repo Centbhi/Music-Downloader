@@ -1,7 +1,7 @@
 import hashlib
 import json
 import os
-import subprocess
+from urllib.parse import quote
 
 import requests
 from yt_dlp import YoutubeDL
@@ -14,7 +14,7 @@ except ImportError:
 
 try:
     from mutagen.mp3 import MP3
-    from mutagen.id3 import ID3, APIC, ID3NoHeaderError
+    from mutagen.id3 import ID3, APIC
     _HAS_MUTAGEN_ID3 = True
 except ImportError:
     _HAS_MUTAGEN_ID3 = False
@@ -143,7 +143,8 @@ def _search_ytdlp_fallback(query, limit):
     results = []
     with YoutubeDL(dict(FLAT_OPTS)) as ydl:
         data = ydl.extract_info(
-            f"https://music.youtube.com/search?q={query}", download=False)
+            f"https://music.youtube.com/search?q={quote(query)}",
+            download=False)
     for entry in (data.get('entries') or []):
         if not entry:
             continue
@@ -171,6 +172,35 @@ def fetch_image_bytes(url):
     return r.content
 
 
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def _prune_cache_dir(directory, max_files):
+    """Drop the oldest files once a cache dir exceeds max_files.
+
+    Cached thumbs/covers are keyed by content hash, so a deleted or
+    re-tagged song orphans its entries forever; a size cap keeps growth
+    bounded. Removed entries simply regenerate on next use.
+    """
+    try:
+        files = [os.path.join(directory, n) for n in os.listdir(directory)]
+    except OSError:
+        return
+    files = [p for p in files if os.path.isfile(p)]
+    if len(files) <= max_files:
+        return
+    files.sort(key=_mtime)
+    for path in files[:len(files) - max_files]:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def thumbnail_path(url):
     if not url:
         return None
@@ -181,18 +211,10 @@ def thumbnail_path(url):
             data = fetch_image_bytes(url)
             with open(dest, "wb") as f:
                 f.write(data)
+            _prune_cache_dir(CACHE_DIR, 500)
         except Exception:
             return None
     return dest if os.path.exists(dest) else None
-
-
-_CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
-
-
-def _run(args, **kwargs):
-    if os.name == 'nt':
-        kwargs.setdefault('creationflags', _CREATE_NO_WINDOW)
-    return subprocess.run(args, **kwargs)
 
 
 def probe_tags(mp3_path):
@@ -227,23 +249,11 @@ def extract_cover_path(mp3_path):
             if isinstance(tag, APIC):
                 with open(dest, 'wb') as f:
                     f.write(tag.data)
+                _prune_cache_dir(COVER_DIR, 300)
                 return dest
     except Exception:
         pass
     return None
-
-
-def preview_url(url):
-    with YoutubeDL(dict(FLAT_OPTS)) as ydl:
-        data = ydl.extract_info(url, download=False)
-    entries = data.get('entries')
-    if entries is not None:
-        available = sum(1 for e in entries if e)
-        return {'kind': 'playlist',
-                'title': data.get('title', 'Playlist'),
-                'count': available}
-    return {'kind': 'video',
-            'title': data.get('title', 'Video')}
 
 
 def download_url(url, progress_cb=None, cancel_flag=None):
@@ -263,7 +273,8 @@ def download_url(url, progress_cb=None, cancel_flag=None):
 
     with YoutubeDL(dict(OPTIONS2)) as ydl:
         playlists = ydl.extract_info(url, download=False, process=False)
-        playlist_name = playlists['title']
+        playlist_name = sanitize_filename(
+            playlists.get('title') or 'Playlist')
 
     playlist_path = os.path.join(PLAYLIST_DIR, f"{playlist_name}.m3u")
     with open(playlist_path, "w", encoding="utf-8-sig") as f:
@@ -344,18 +355,10 @@ def persist_playlist_url(playlist_path, url):
             f.write(line)
 
 
-def song_exists(entry_path):
-    full = os.path.join(PLAYLIST_DIR, entry_path.replace('/', os.sep))
-    return os.path.exists(full)
-
-
-def remove_song(playlist_path, entry_path):
-    full = os.path.join(PLAYLIST_DIR, entry_path.replace('/', os.sep))
-    if os.path.exists(full):
-        os.remove(full)
-    if playlist_path is None:
-        return
+def _rewrite_m3u_without(playlist_path, entry_path):
     entries = read_m3u(playlist_path)
+    if entry_path not in entries:
+        return False
     header = []
     with open(playlist_path, encoding="utf-8-sig") as f:
         for line in f:
@@ -370,6 +373,39 @@ def remove_song(playlist_path, entry_path):
         for line in entries:
             if line != entry_path:
                 f.write(f"{line}\n")
+    return True
+
+
+def remove_entry_from_playlist(playlist_path, entry_path):
+    """Remove an entry from an .m3u only; keeps the file on disk."""
+    if playlist_path is None:
+        return False
+    return _rewrite_m3u_without(playlist_path, entry_path)
+
+
+def delete_song_everywhere(entry_path):
+    """Delete the mp3 file and strip its entry from every .m3u.
+
+    Returns the list of affected playlist display names (without .m3u).
+    """
+    full = os.path.join(PLAYLIST_DIR, entry_path.replace('/', os.sep))
+    if os.path.exists(full):
+        os.remove(full)
+    affected = []
+    try:
+        names = sorted(os.listdir(PLAYLIST_DIR))
+    except OSError:
+        return affected
+    for name in names:
+        if not name.endswith('.m3u'):
+            continue
+        path = os.path.join(PLAYLIST_DIR, name)
+        try:
+            if _rewrite_m3u_without(path, entry_path):
+                affected.append(os.path.splitext(name)[0])
+        except OSError:
+            continue
+    return affected
 
 
 def open_folder(path):
@@ -430,8 +466,13 @@ def get_artists(songs):
                 cache = json.load(f)
         except Exception:
             cache = {}
-    result = {}
     changed = False
+    # Entries for deleted files would otherwise live in the cache forever.
+    for key in list(cache):
+        if not os.path.exists(key):
+            del cache[key]
+            changed = True
+    result = {}
     for s in songs:
         key = os.path.normpath(s['full'])
         mtime = s.get('mtime') or 0

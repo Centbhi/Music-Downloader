@@ -1,11 +1,10 @@
 import hashlib
 import json
 import os
+import re
 from urllib.parse import quote
 
 import requests
-from yt_dlp import YoutubeDL
-from yt_dlp.utils import sanitize_filename
 
 try:
     from mutagen.easyid3 import EasyID3
@@ -30,7 +29,9 @@ MUSIC_DIR = os.path.join(PLAYLIST_DIR, "Songs")
 PODCAST_DIR = os.path.join(PLAYLIST_DIR, "Podcasts")
 CACHE_DIR = os.path.join(".cache", "thumbs")
 COVER_DIR = os.path.join(".cache", "covers")
-for _dir in (PLAYLIST_DIR, MUSIC_DIR, PODCAST_DIR, CACHE_DIR, COVER_DIR):
+LYRICS_DIR = os.path.join(".cache", "lyrics")
+for _dir in (PLAYLIST_DIR, MUSIC_DIR, PODCAST_DIR, CACHE_DIR, COVER_DIR,
+             LYRICS_DIR):
     os.makedirs(_dir, exist_ok=True)
 
 _yt = None
@@ -47,6 +48,35 @@ class DownloadCancelled(Exception):
     pass
 
 
+def sanitize_filename(name):
+    """yt-dlp's filename sanitizer, imported lazily so `core` stays
+    importable without yt-dlp (tests, tooling)."""
+    from yt_dlp.utils import sanitize_filename as _sanitize
+    return _sanitize(name)
+
+
+_SONG_ID_SUFFIX = re.compile(r'\s*\[[A-Za-z0-9_-]{6}\]$')
+
+
+def display_title(text):
+    """Title or filename minus a trailing ' [XXXXXX]' id and .mp3.
+
+    String-based (no splitext) so dotted titles like "Mr. Loverman" keep
+    their dots.
+    """
+    name = text or ''
+    if name.lower().endswith('.mp3'):
+        name = name[:-4]
+    return _SONG_ID_SUFFIX.sub('', name)
+
+
+_YTDLP_COMMON = {
+    'js_runtimes': {
+        'node': {}
+    },
+    'remote_components': ['ejs:github'],
+}
+
 OPTIONS = {
     'format': 'bestaudio/best',
     'outtmpl': f'{MUSIC_DIR}/%(title)s [%(id).6s].%(ext)s',
@@ -62,23 +92,17 @@ OPTIONS = {
     'addmetadata': True,
     'replace_in_metadata': {'artist': {', ': '/'}},
     'download_archive': 'archives.txt',
-    'js_runtimes': {
-        'node': {}
-    },
     'playlistend': None,
     'playlist_items': '1-',
     'extract_flat': False,
-    'remote_components': ['ejs:github'],
+    **_YTDLP_COMMON,
 }
 
 OPTIONS2 = {
-    'js_runtimes': {
-        'node': {}
-    },
     'extract_flat': 'in_playlist',
     'playlistend': None,
     'playlist_items': '1-',
-    'remote_components': ['ejs:github'],
+    **_YTDLP_COMMON,
 }
 
 FLAT_OPTS = {
@@ -86,9 +110,7 @@ FLAT_OPTS = {
     'skip_download': True,
     'ignoreerrors': True,
     'extract_flat': 'in_playlist',
-    'js_runtimes': {
-        'node': {}
-    },
+    **_YTDLP_COMMON,
 }
 
 
@@ -140,6 +162,7 @@ def _search_ytmusic(query, limit):
 
 
 def _search_ytdlp_fallback(query, limit):
+    from yt_dlp import YoutubeDL
     results = []
     with YoutubeDL(dict(FLAT_OPTS)) as ydl:
         data = ydl.extract_info(
@@ -256,7 +279,245 @@ def extract_cover_path(mp3_path):
     return None
 
 
+def audio_duration(path):
+    """Track length in seconds via mutagen, or None."""
+    if not _HAS_MUTAGEN_ID3:
+        return None
+    try:
+        return MP3(path).info.length
+    except Exception:
+        return None
+
+
+_LRC_TAG = re.compile(r'\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]')
+
+
+def parse_lrc(text):
+    """Parse LRC into a sorted [(ms, line)] list.
+
+    One line may carry several timestamps; metadata tags ([ar:], [ti:], ...)
+    have no timestamp and are dropped.
+    """
+    if not text:
+        return []
+    out = []
+    for raw in text.splitlines():
+        stamps = _LRC_TAG.findall(raw)
+        if not stamps:
+            continue
+        line = _LRC_TAG.sub('', raw).strip()
+        for minutes, seconds, frac in stamps:
+            ms = int(minutes) * 60000 + int(seconds) * 1000
+            if frac:
+                # .xx = centiseconds, .xxx = milliseconds.
+                ms += int(frac.ljust(3, '0')[:3])
+            out.append((ms, line))
+    out.sort(key=lambda row: row[0])
+    return out
+
+
+_VTT_TIME = re.compile(
+    r'^(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\.(\d{3})\s*-->')
+
+
+def parse_vtt(text):
+    """Parse WebVTT captions into a sorted [(ms, line)] list."""
+    if not text:
+        return []
+    out = []
+    current = None
+    buf = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            if current is not None:
+                if buf:
+                    out.append((current, ' '.join(buf)))
+                current, buf = None, []
+            continue
+        match = _VTT_TIME.match(line)
+        if match:
+            if current is not None and buf:
+                out.append((current, ' '.join(buf)))
+            hours, minutes, seconds, millis = match.groups()
+            current = ((int(hours or 0) * 3600 + int(minutes) * 60
+                        + int(seconds)) * 1000 + int(millis))
+            buf = []
+            continue
+        if current is None:
+            continue  # header or cue identifier before its timing line
+        clean = re.sub(r'<[^>]+>', '', line)
+        if clean:
+            buf.append(clean)
+    if current is not None and buf:
+        out.append((current, ' '.join(buf)))
+    out.sort(key=lambda row: row[0])
+    return out
+
+
+def _parse_json3(data):
+    """Parse YouTube json3 caption payloads into the VTT/LRC row shape."""
+    out = []
+    for event in (data or {}).get('events') or []:
+        ms = event.get('tStartMs')
+        text = ''.join(seg.get('utf8', '')
+                       for seg in event.get('segs') or [])
+        text = text.replace('\n', ' ').strip()
+        if ms is None or not text:
+            continue
+        out.append((int(ms), text))
+    out.sort(key=lambda row: row[0])
+    return out
+
+
+def _lrc_line(ms, text):
+    return f"[{ms // 60000:02d}:{ms % 60000 // 1000:02d}.{ms % 1000 // 10:02d}]{text}"
+
+
+def lyrics_cache_path(mp3_path):
+    key = hashlib.md5(
+        f"{os.path.abspath(mp3_path)}{os.path.getmtime(mp3_path)}"
+        .encode('utf-8')).hexdigest()
+    return os.path.join(LYRICS_DIR, f"{key}.json")
+
+
+def _lyrics_result(synced, plain, source):
+    return {'synced': synced or None, 'plain': plain or None,
+            'source': source}
+
+
+def _lrclib_json(endpoint, params):
+    try:
+        r = requests.get(f'https://lrclib.net/api/{endpoint}', params=params,
+                         timeout=10,
+                         headers={'User-Agent': 'MusicDownloader/1.0'})
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_lrclib(artist, title, album, duration):
+    params = {'artist_name': artist, 'track_name': title}
+    if album:
+        params['album_name'] = album
+    if duration:
+        params['duration'] = int(round(duration))
+    data = _lrclib_json('get', params)
+    if data and (data.get('syncedLyrics') or data.get('plainLyrics')):
+        return _lyrics_result(data.get('syncedLyrics'),
+                              data.get('plainLyrics'), 'lrclib')
+    # Close-duration match from search; >5s off means a different recording.
+    results = _lrclib_json('search',
+                           {'artist_name': artist, 'track_name': title})
+    best, best_delta = None, None
+    for item in results or []:
+        if not (item.get('syncedLyrics') or item.get('plainLyrics')):
+            continue
+        if duration and item.get('duration'):
+            delta = abs(item['duration'] - duration)
+        else:
+            delta = 0.0
+        if best_delta is None or delta < best_delta:
+            best, best_delta = item, delta
+    if best and best_delta is not None and best_delta <= 5:
+        return _lyrics_result(best.get('syncedLyrics'),
+                              best.get('plainLyrics'), 'lrclib')
+    return None
+
+
+def _fetch_yt_captions(artist, title, duration):
+    """Best-effort captions fallback: search YouTube, grab en subs.
+
+    The library only keeps 6-char video IDs in filenames, so the video is
+    resolved by search; a duration check guards against wrong matches.
+    """
+    from yt_dlp import YoutubeDL
+    try:
+        with YoutubeDL({'quiet': True, 'skip_download': True,
+                        'extract_flat': 'in_playlist',
+                        'js_runtimes': {'node': {}}}) as ydl:
+            found = ydl.extract_info(f"ytsearch1:{artist} {title}",
+                                     download=False)
+        entries = (found or {}).get('entries') or []
+        entry = entries[0] if entries else None
+        if not entry or not entry.get('id'):
+            return None
+        if duration and entry.get('duration'):
+            if abs(entry['duration'] - duration) > 15:
+                return None
+        with YoutubeDL({'quiet': True, 'skip_download': True,
+                        'js_runtimes': {'node': {}}}) as ydl:
+            full = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={entry['id']}",
+                download=False)
+        tracks = ((full or {}).get('subtitles') or {}).get('en') or []
+        tracks += ((full or {}).get('automatic_captions') or {}).get('en') or []
+        url = None
+        for track in tracks:
+            if track.get('ext') == 'vtt':
+                url = track.get('url')
+                break
+        if not url:
+            for track in tracks:
+                if track.get('ext') == 'json3':
+                    url = track.get('url')
+                    break
+        if not url:
+            return None
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        rows = _parse_json3(r.json()) if 'json3' in url else parse_vtt(r.text)
+        if not rows:
+            return None
+        synced = '\n'.join(_lrc_line(ms, line) for ms, line in rows)
+        plain = '\n'.join(line for _, line in rows if line)
+        return _lyrics_result(synced, plain, 'youtube')
+    except Exception:
+        return None
+
+
+def fetch_lyrics(mp3_path, artist=None, title=None, album=None,
+                 duration=None):
+    """Fetch synced/plain lyrics for a track, cached on disk.
+
+    Tries LRCLIB (synced first), then YouTube captions. Negative results
+    are cached too so a miss is not re-fetched on every playback.
+    """
+    try:
+        dest = lyrics_cache_path(mp3_path)
+    except OSError:
+        return _lyrics_result(None, None, 'none')
+    if os.path.exists(dest):
+        try:
+            with open(dest, encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    if not (artist and title):
+        tags = probe_tags(mp3_path)
+        artist = artist or tags.get('artist')
+        title = title or tags.get('title')
+        album = album or tags.get('album')
+    if duration is None:
+        duration = audio_duration(mp3_path)
+    result = _lyrics_result(None, None, 'none')
+    if artist and title:
+        result = _fetch_lrclib(artist, title, album, duration) or result
+        if result['source'] == 'none':
+            result = _fetch_yt_captions(artist, title, duration) or result
+    try:
+        with open(dest, 'w', encoding='utf-8') as f:
+            json.dump(result, f)
+        _prune_cache_dir(LYRICS_DIR, 300)
+    except Exception:
+        pass
+    return result
+
+
 def download_url(url, progress_cb=None, cancel_flag=None):
+    from yt_dlp import YoutubeDL
     opts = dict(OPTIONS)
     opts['progress_hooks'] = [_make_hook(progress_cb, cancel_flag)]
 
@@ -446,16 +707,8 @@ ARTIST_CACHE = os.path.join(".cache", "artists.json")
 
 
 def _read_artist(path):
-    if EasyID3 is None:
-        return None
-    try:
-        tags = EasyID3(path)
-        artists = tags.get('artist')
-        if artists:
-            return str(artists[0]).strip() or None
-    except Exception:
-        pass
-    return None
+    value = (probe_tags(path).get('artist') or '').strip()
+    return value or None
 
 
 def get_artists(songs):

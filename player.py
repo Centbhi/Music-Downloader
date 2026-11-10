@@ -1,5 +1,4 @@
 import os
-import re
 
 from PyQt5.QtCore import QObject, Qt, QRect, QRectF, QSize, QThread, QUrl, pyqtSignal
 from PyQt5.QtGui import (QBrush, QColor, QFont, QFontMetrics, QLinearGradient,
@@ -289,13 +288,10 @@ class PlaybackManager(QObject):
     def _on_media_status(self, status):
         if status == QMediaPlayer.LoadedMedia and self._pending_pos is not None:
             pos, self._pending_pos = self._pending_pos, None
-            try:
-                dur = self.player.duration()
-                if dur > 0:
-                    pos = max(0, min(pos, dur))
-                self.player.setPosition(pos)
-            except Exception:
-                pass
+            dur = self.player.duration()
+            if dur > 0:
+                pos = max(0, min(pos, dur))
+            self.player.setPosition(pos)
         if status == QMediaPlayer.EndOfMedia:
             if self._loop_mode == 'current':
                 self.player.setPosition(0)
@@ -423,8 +419,6 @@ class PlayerBar(QWidget):
         super().__init__(parent)
         self.playback = PlaybackManager(self)
         self._cover = None
-        self._meta_worker = None
-        self._meta_workers = []
         self._build()
         self._connect()
 
@@ -598,14 +592,11 @@ class PlayerBar(QWidget):
         self.vol_btn.setIcon(icons.make_icon(name, style.MUTED, 16))
 
     def _toggle_mute(self):
-        if self.playback.player.volume() > 0:
-            self._saved_vol = self.playback.player.volume()
-            self.playback.set_volume(0)
+        if self.volume_slider.value() > 0:
+            self._saved_vol = self.volume_slider.value()
             self.volume_slider.setValue(0)
         else:
-            saved = getattr(self, '_saved_vol', 70)
-            self.playback.set_volume(saved)
-            self.volume_slider.setValue(saved)
+            self.volume_slider.setValue(getattr(self, '_saved_vol', 70))
 
     def _on_position(self, ms):
         self.seek_bar.setValue(ms)
@@ -618,27 +609,15 @@ class PlayerBar(QWidget):
     def _on_track(self, path):
         self.current_track.emit(path)
         self._current_path = path
-        name = os.path.basename(path)
-        display = re.sub(r"\s*\[[A-Za-z0-9_-]{6}\]\.mp3$", "", name)
-        display = os.path.splitext(display)[0]
+        display = core.display_title(os.path.basename(path))
         self._set_meta(display, "")
         self.cover_label.setPixmap(icons.make_pixmap('music_note', style.MUTED, 24))
         self._cover = None
-        worker = TrackMetaWorker(path)
-        self._meta_worker = worker
-        # Keep a strong ref until finished so rapid track changes cannot
-        # drop the last reference to a still-running QThread.
-        self._meta_workers.append(worker)
+        # Parented to self: the thread object cannot be garbage-collected
+        # while running, so no ref bookkeeping is needed.
+        worker = TrackMetaWorker(path, self)
         worker.done.connect(self._on_meta)
-        worker.finished.connect(lambda w=worker: self._release_meta_worker(w))
         worker.start()
-
-    def _release_meta_worker(self, worker):
-        worker.deleteLater()
-        try:
-            self._meta_workers.remove(worker)
-        except ValueError:
-            pass
 
     def _elide_2lines(self, text, font_size):
         if not text:
@@ -691,9 +670,7 @@ class PlayerBar(QWidget):
                                self.cover_label.height()))
                 self._cover = cover
         artist = tags.get('artist') or tags.get('albumartist') or ''
-        title = os.path.basename(path)
-        title = re.sub(r"\s*\[[A-Za-z0-9_-]{6}\]\.mp3$", "", title)
-        title = os.path.splitext(title)[0]
+        title = core.display_title(os.path.basename(path))
         playlists = core.playlists_for_song(path)
         self._set_meta(title, artist, playlists)
 

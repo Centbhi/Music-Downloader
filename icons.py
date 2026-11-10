@@ -25,6 +25,9 @@ _ICONS = {
     'repeat_one': "M460-360v-180h-60v-60h120v240h-60ZM280-80 120-240l160-160 56 58-62 62h406v-160h80v240H274l62 62-56 58Zm-80-440v-240h486l-62-62 56-58 160 160-160 160-56-58 62-62H280v160h-80Z",
     
     'playlist': "M120-640v-80h720v80H120Zm0 160v-80h720v80H120Zm0 160v-80h440v80H120ZM640-160v-320l240 160-240 160Z",
+    # Speech bubble (outer + inner cutout) + tail + text bars; relies on
+    # fill-rule evenodd (see _EVENODD).
+    'lyrics': "M240-880h480q40 0 40 40v560q0 40-40 40H240q-40 0-40-40v-560q0-40 40-40ZM300-820h360q40 0 40 40v440q0 40-40 40H300q-40 0-40-40v-440q0-40 40-40ZM240-240h120l-120 80ZM320-720h320v60H320ZM320-620h320v60H320ZM320-520h200v60H320Z",
     'minimize': "M200-520h560v80H200v-80Z",
     'maximize': "M200-200h560v-560H200v560Zm80-80v-400h400v400H280Z",
     'restore': "M160-160h440v-440H160v440Zm70-70v-300h300v300H230Z M360-360h440v-440H360v440Zm70-70v-300h300v300H430Z",
@@ -33,14 +36,19 @@ _ICONS = {
 
 _cache = {}
 
+# Glyphs whose subpaths must use evenodd fill; the default nonzero rule
+# would fill their knockouts (overlapping shapes like 'close' stay nonzero).
+_EVENODD = {'lyrics'}
+
 
 def make_pixmap(name, color=style.TEXT, size=20):
     key = (name, color, size)
     if key in _cache:
         return _cache[key]
+    rule = " fill-rule='evenodd'" if name in _EVENODD else ""
     svg = (
         f"<svg xmlns='http://www.w3.org/2000/svg' width='{size}' height='{size}' "
-        f"viewBox='{_VIEWBOX}' fill='{color}'><path d='{_ICONS[name]}'/></svg>"
+        f"viewBox='{_VIEWBOX}' fill='{color}'><path{rule} d='{_ICONS[name]}'/></svg>"
     )
     renderer = QSvgRenderer(QByteArray(svg.encode()))
     pix = QPixmap(size, size)

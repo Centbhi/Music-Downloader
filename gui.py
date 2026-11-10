@@ -1,5 +1,5 @@
+import json
 import os
-import re
 import sys
 import ctypes
 from datetime import datetime
@@ -53,7 +53,7 @@ def rounded_pixmap(src, size, radius):
 
 
 def _song_cells(song, artist):
-    title = re.sub(r"\s*\[[A-Za-z0-9_-]{6}\]$", "", song['title'])
+    title = core.display_title(song['title'])
     date = (datetime.fromtimestamp(song['mtime']).strftime('%Y-%m-%d')
             if song['mtime'] else '')
     return title, artist or '', date
@@ -85,18 +85,42 @@ def _populate_song_table(table, rows, current_path=None):
         items[0].setData(Qt.UserRole, r.get('user_data'))
         if r.get('tooltip'):
             items[0].setToolTip(r['tooltip'])
-        if playing:
-            for it in items:
-                it.setForeground(QColor(style.ACCENT_HOVER))
         for col, it in enumerate(items):
             table.setItem(row, col, it)
-    if hasattr(table, '_playing_delegate'):
-        playing_rows = set()
-        if current_path:
-            for row, r in enumerate(rows):
-                if os.path.normpath(r['full']) == os.path.normpath(current_path):
-                    playing_rows.add(row)
-        table._playing_delegate.setPlayingRows(playing_rows)
+    playing_rows = set()
+    if current_path:
+        for row, r in enumerate(rows):
+            if os.path.normpath(r['full']) == os.path.normpath(current_path):
+                playing_rows.add(row)
+    table._playing_delegate.setPlayingRows(playing_rows)
+
+
+def update_playing_indicator(table, displayed, old_path, new_path):
+    """Move the "playing" marker: arrow prefix + delegate color rows.
+
+    Text color comes from _PlayingDelegate (it paints playing rows); this
+    only keeps the prefix and the delegate's row set in sync.
+    """
+    old_norm = os.path.normpath(old_path) if old_path else None
+    new_norm = os.path.normpath(new_path) if new_path else None
+    for row, song in enumerate(displayed):
+        full = os.path.normpath(song['full'])
+        item0 = table.item(row, 0)
+        if not item0:
+            continue
+        text = item0.text()
+        if old_norm and full == old_norm and text.startswith("\u25B6 "):
+            text = text[2:]
+        if new_norm and full == new_norm and not text.startswith("\u25B6"):
+            text = "\u25B6 " + text
+        if text != item0.text():
+            item0.setText(text)
+    playing_rows = set()
+    if new_norm:
+        for row, song in enumerate(displayed):
+            if os.path.normpath(song['full']) == new_norm:
+                playing_rows.add(row)
+    table._playing_delegate.setPlayingRows(playing_rows)
 
 
 
@@ -434,6 +458,21 @@ class SearchWorker(QThread):
             self.failed.emit(str(e))
 
 
+class LyricsWorker(QThread):
+    done = pyqtSignal(str, dict)
+
+    def __init__(self, mp3_path, parent=None):
+        super().__init__(parent)
+        self.mp3_path = mp3_path
+
+    def run(self):
+        try:
+            data = core.fetch_lyrics(self.mp3_path)
+        except Exception:
+            data = {'synced': None, 'plain': None, 'source': 'none'}
+        self.done.emit(self.mp3_path, data)
+
+
 class DownloadWorker(QThread):
     log = pyqtSignal(str)
     done = pyqtSignal(object)
@@ -482,7 +521,6 @@ class DownloadTab(QWidget):
         self.on_download_finished = on_download_finished
         self.worker = None
         self.search_worker = None
-        self._search_workers = []
         self._build()
 
     def _build(self):
@@ -552,27 +590,18 @@ class DownloadTab(QWidget):
             return
         self._clear_results()
         self.status_message.emit(f"Searching for \"{query}\"...")
-        worker = SearchWorker(query)
+        # Parented to self: the thread object cannot be garbage-collected
+        # while running, so no ref bookkeeping is needed.
+        worker = SearchWorker(query, self)
         self.search_worker = worker
-        # Keep a strong ref until finished so a new search cannot drop the
-        # last reference to a still-running QThread.
-        self._search_workers.append(worker)
         worker.results.connect(self.show_results)
         worker.failed.connect(self._on_search_failed)
-        worker.finished.connect(lambda w=worker: self._release_search_worker(w))
         worker.start()
 
     def _on_search_failed(self, error):
         if self.sender() is not self.search_worker:
             return
         self.status_message.emit(f"Search failed: {error}")
-
-    def _release_search_worker(self, worker):
-        worker.deleteLater()
-        try:
-            self._search_workers.remove(worker)
-        except ValueError:
-            pass
 
     def _clear_results(self):
         while self.results_layout.count() > 1:
@@ -968,43 +997,7 @@ class LibraryTab(QWidget):
     def set_current_path(self, path):
         old = self.current_path
         self.current_path = path
-        self._update_playing_indicator(old, path)
-
-    def _update_playing_indicator(self, old_path, new_path):
-        table = self.song_table
-        old_norm = os.path.normpath(old_path) if old_path else None
-        new_norm = os.path.normpath(new_path) if new_path else None
-        for row, song in enumerate(self._displayed):
-            s = os.path.normpath(song['full'])
-            is_old = bool(old_norm and s == old_norm)
-            is_new = bool(new_norm and s == new_norm)
-            if not is_old and not is_new:
-                continue
-            item0 = table.item(row, 0)
-            if not item0:
-                continue
-            text = item0.text()
-            if is_new:
-                if not text.startswith("\u25B6"):
-                    item0.setText("\u25B6 " + text)
-                for c in range(table.columnCount()):
-                    it = table.item(row, c)
-                    if it:
-                        it.setForeground(QColor(style.ACCENT_HOVER))
-            elif is_old:
-                if text.startswith("\u25B6 "):
-                    item0.setText(text[2:])
-                for c in range(table.columnCount()):
-                    it = table.item(row, c)
-                    if it:
-                        it.setForeground(QColor(style.TEXT))
-        playing_rows = set()
-        if new_norm:
-            for row, song in enumerate(self._displayed):
-                if os.path.normpath(song['full']) == new_norm:
-                    playing_rows.add(row)
-        if hasattr(table, '_playing_delegate'):
-            table._playing_delegate.setPlayingRows(playing_rows)
+        update_playing_indicator(self.song_table, self._displayed, old, path)
 
     def _on_song_filter(self, _):
         if self.playlist_list.currentItem():
@@ -1227,43 +1220,7 @@ class AllSongsTab(QWidget):
     def set_current_path(self, path):
         old = self.current_path
         self.current_path = path
-        self._update_playing_indicator(old, path)
-
-    def _update_playing_indicator(self, old_path, new_path):
-        table = self.song_table
-        old_norm = os.path.normpath(old_path) if old_path else None
-        new_norm = os.path.normpath(new_path) if new_path else None
-        for row, song in enumerate(self._displayed):
-            s = os.path.normpath(song['full'])
-            is_old = bool(old_norm and s == old_norm)
-            is_new = bool(new_norm and s == new_norm)
-            if not is_old and not is_new:
-                continue
-            item0 = table.item(row, 0)
-            if not item0:
-                continue
-            text = item0.text()
-            if is_new:
-                if not text.startswith("\u25B6"):
-                    item0.setText("\u25B6 " + text)
-                for c in range(table.columnCount()):
-                    it = table.item(row, c)
-                    if it:
-                        it.setForeground(QColor(style.ACCENT_HOVER))
-            elif is_old:
-                if text.startswith("\u25B6 "):
-                    item0.setText(text[2:])
-                for c in range(table.columnCount()):
-                    it = table.item(row, c)
-                    if it:
-                        it.setForeground(QColor(style.TEXT))
-        playing_rows = set()
-        if new_norm:
-            for row, song in enumerate(self._displayed):
-                if os.path.normpath(song['full']) == new_norm:
-                    playing_rows.add(row)
-        if hasattr(table, '_playing_delegate'):
-            table._playing_delegate.setPlayingRows(playing_rows)
+        update_playing_indicator(self.song_table, self._displayed, old, path)
 
     def _play_item(self, row, _col=None):
         song = self._displayed[row]
@@ -1349,13 +1306,9 @@ class AllSongsTab(QWidget):
         if chosen is None:
             return
         if chosen is delete_act:
-            try:
-                containing = core.playlists_for_song(song['full'])
-            except Exception:
-                containing = []
-            if containing:
+            if member:
                 extra = (f"\nAlso removes it from: "
-                         f"{', '.join(containing)}.")
+                         f"{', '.join(sorted(member))}.")
             else:
                 extra = ""
             ret = QMessageBox.question(
@@ -1394,6 +1347,177 @@ class AllSongsTab(QWidget):
                 self.on_change()
 
 
+class _LyricLine(QLabel):
+    clicked = pyqtSignal(int)
+
+    def __init__(self, ms, text, parent=None):
+        super().__init__(text, parent)
+        self.ms = ms
+        self.setWordWrap(True)
+        if ms is not None:
+            self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if self.ms is not None:
+            self.clicked.emit(self.ms)
+        super().mousePressEvent(event)
+
+
+class LyricsView(QWidget):
+    """Spotify-style lyrics page: synced highlight, auto-scroll, click-to-seek."""
+
+    seek_requested = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._path = None
+        self._lines = []
+        self._current = -1
+        self._dirty = False
+        self._build()
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 20, 24, 16)
+        root.setSpacing(12)
+
+        title = QLabel("Lyrics")
+        title.setObjectName("navheader")
+        root.addWidget(title)
+
+        self.status_label = QLabel("Nothing playing")
+        self.status_label.setObjectName("muted")
+        root.addWidget(self.status_label)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.container = QWidget()
+        self.lines_layout = QVBoxLayout(self.container)
+        self.lines_layout.setContentsMargins(8, 12, 8, 12)
+        self.lines_layout.setSpacing(12)
+        self.lines_layout.addStretch(1)
+        self.scroll.setWidget(self.container)
+        root.addWidget(self.scroll, 1)
+        self.scroll.hide()
+
+    def load(self, path):
+        self._path = path
+        self._current = -1
+        if not path:
+            self._clear_lines()
+            self.scroll.hide()
+            self.status_label.setText("Nothing playing")
+            return
+        if not self.isVisible():
+            self._dirty = True
+            return
+        self._fetch(path)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._dirty:
+            self._dirty = False
+            if self._path:
+                self._fetch(self._path)
+
+    def _fetch(self, path):
+        try:
+            cache = core.lyrics_cache_path(path)
+        except OSError:
+            cache = None
+        if cache and os.path.exists(cache):
+            try:
+                with open(cache, encoding='utf-8') as f:
+                    self._show(path, json.load(f))
+                return
+            except Exception:
+                pass
+        self._clear_lines()
+        self.scroll.hide()
+        self.status_label.setText("Loading lyrics...")
+        # Parented to self: the thread object cannot be garbage-collected
+        # while running, so no ref bookkeeping is needed.
+        worker = LyricsWorker(path, self)
+        worker.done.connect(self._on_lyrics)
+        worker.start()
+
+    def _on_lyrics(self, path, data):
+        if path != self._path:
+            return
+        self._show(path, data)
+
+    def _clear_lines(self):
+        while self.lines_layout.count() > 1:
+            item = self.lines_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self._lines = []
+        self._current = -1
+
+    def _show(self, path, data):
+        self._clear_lines()
+        if path != self._path:
+            return
+        synced = data.get('synced')
+        plain = data.get('plain')
+        source = data.get('source') or 'none'
+        rows = []
+        if synced:
+            # LRC lines may be empty (instrumental gaps); skip for display.
+            rows = [(ms, text) for ms, text in core.parse_lrc(synced) if text]
+        if not rows and plain:
+            rows = [(None, line.strip()) for line in plain.splitlines()
+                    if line.strip()]
+        if not rows:
+            self.scroll.hide()
+            self.status_label.setText("No lyrics found")
+            return
+        for ms, text in rows:
+            label = _LyricLine(ms, text)
+            label.clicked.connect(self.seek_requested)
+            self.lines_layout.insertWidget(
+                self.lines_layout.count() - 1, label)
+            self._lines.append(label)
+        self._apply_style(-1)
+        timed = any(label.ms is not None for label in self._lines)
+        src = {'lrclib': 'LRCLIB',
+               'youtube': 'YouTube captions'}.get(source, '')
+        kind = 'synced lyrics' if timed else 'lyrics'
+        self.status_label.setText(f"{src} - {kind}" if src else kind)
+        self.scroll.show()
+        self.scroll.verticalScrollBar().setValue(0)
+
+    def _apply_style(self, current):
+        for i, label in enumerate(self._lines):
+            if i == current:
+                label.setStyleSheet(
+                    f"color: {style.TEXT}; font-size: 19px;"
+                    " font-weight: 700;")
+            else:
+                label.setStyleSheet(
+                    f"color: {style.MUTED}; font-size: 15px;"
+                    " font-weight: 500;")
+
+    def set_position(self, ms):
+        if not any(label.ms is not None for label in self._lines):
+            return
+        idx = -1
+        for i, label in enumerate(self._lines):
+            if label.ms is None:
+                continue
+            if label.ms <= ms:
+                idx = i
+            else:
+                break
+        if idx != self._current:
+            self._current = idx
+            self._apply_style(idx)
+            if 0 <= idx < len(self._lines):
+                self.scroll.ensureWidgetVisible(self._lines[idx], 0, 140)
+
+
 class SpaceToggleFilter(QObject):
     def __init__(self, playback, parent=None):
         super().__init__(parent)
@@ -1403,6 +1527,7 @@ class SpaceToggleFilter(QObject):
         if (event.type() == QEvent.KeyPress
                 and event.key() == Qt.Key_Space
                 and not event.modifiers()
+                and not event.isAutoRepeat()
                 and QApplication.activeModalWidget() is None):
             focus = QApplication.focusWidget()
             if focus is None or not isinstance(
@@ -1816,10 +1941,12 @@ class MainWindow(QMainWindow):
             icons.make_icon('songs', style.MUTED, 16), "All Songs"))
         self.nav.addItem(QListWidgetItem(
             icons.make_icon('playlist', style.MUTED, 16), "Queue"))
+        self.nav.addItem(QListWidgetItem(
+            icons.make_icon('lyrics', style.MUTED, 16), "Lyrics"))
         self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.nav.viewport().installEventFilter(NoScrollFilter(self.nav))
-        self.nav.setFixedHeight(204)
+        self.nav.setFixedHeight(255)
         sbox.addWidget(self.nav)
         sbox.addStretch(1)
 
@@ -1831,10 +1958,12 @@ class MainWindow(QMainWindow):
         self.all_songs_tab = AllSongsTab(
             play_request=self.play_request, on_change=self.refresh_library)
         self.queue_tab = QueueTab(play_request=self.play_request)
+        self.lyrics_view = LyricsView()
         self.stack.addWidget(self.download_tab)
         self.stack.addWidget(self.library_tab)
         self.stack.addWidget(self.all_songs_tab)
         self.stack.addWidget(self.queue_tab)
+        self.stack.addWidget(self.lyrics_view)
 
         self.body_splitter = QSplitter(Qt.Horizontal)
         self.body_splitter.setChildrenCollapsible(False)
@@ -1848,6 +1977,10 @@ class MainWindow(QMainWindow):
         self.player_bar = PlayerBar()
         self.player_bar.current_track.connect(self.library_tab.set_current_path)
         self.player_bar.current_track.connect(self.all_songs_tab.set_current_path)
+        self.player_bar.current_track.connect(self.lyrics_view.load)
+        self.player_bar.playback.position_changed.connect(
+            self.lyrics_view.set_position)
+        self.lyrics_view.seek_requested.connect(self.player_bar.playback.seek)
         root.addWidget(self.player_bar)
 
         self.setCentralWidget(central)
@@ -1874,6 +2007,7 @@ class MainWindow(QMainWindow):
         if current is not None:
             self._sync_queue()
             self._sync_queue_current(current)
+            self.lyrics_view.load(current)
 
         self._space_filter = SpaceToggleFilter(self.player_bar.playback, self)
         QApplication.instance().installEventFilter(self._space_filter)
@@ -1926,7 +2060,6 @@ class MainWindow(QMainWindow):
         self.player_bar.save_state(settings)
         settings.setValue('window/geometry', self.saveGeometry())
         settings.setValue('window/splitter_body', self.body_splitter.saveState())
-        settings.setValue('player/loop', self.player_bar.playback.loop_mode())
         super().closeEvent(event)
 
     def changeEvent(self, event):
@@ -1994,6 +2127,10 @@ def main():
     app.setStyleSheet(style.QSS)
     win = MainWindow()
     win.show()
+    win.activateWindow()
+    # Start with the play/pause button focused so Space works immediately,
+    # without clicking the window first.
+    win.player_bar.play_btn.setFocus()
     sys.exit(app.exec_())
 
 
